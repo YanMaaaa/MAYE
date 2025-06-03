@@ -8,7 +8,6 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 
-
 ACWrapPolicyType = set[type[nn.Module]] | Callable[[nn.Module, bool, int], bool]
 
 

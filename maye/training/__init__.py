@@ -14,10 +14,7 @@ from .distributed import (
     validate_no_params_on_meta_device,
 )
 from .lr_schedulers import get_cosine_schedule_with_warmup, get_lr
-from .memory import (
-    cleanup_before_training,
-    set_activation_checkpointing,
-)
+from .memory import cleanup_before_training, set_activation_checkpointing
 from .metric_logging import WandBLogger
 from .model_util import disable_dropout
 from .precision import get_dtype, set_default_dtype, validate_expected_param_dtype

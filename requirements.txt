@@ -1,17 +1,14 @@
-torch==2.5.1+cu121
+vllm==0.7.3
+hydra-core==1.4.0.dev1
+hydra-torchrun-launcher @ git+https://github.com/acherstyx/hydra-torchrun-launcher.git
+transformers
+poetry
 sympy
 TexSoup
 math-verify
-ninja
-flash_attn
 psutil
-poetry
-hydra-core==1.4.0.dev1
-hydra-torchrun-launcher @ git+https://github.com/acherstyx/hydra-torchrun-launcher.git
-transformers @ git+https://github.com/huggingface/transformers.git
 accelerate
 colorlog
-vllm
 tqdm
 pandas
 qwen_vl_utils

@@ -1,4 +1,4 @@
-from .math import MathGenerationDataset 
+from .math import MathGenerationDataset
 
 Dataset = MathGenerationDataset
 

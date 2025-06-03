@@ -53,17 +53,6 @@ class PPOFullFinetuneRecipeDistributed:
 
         self.world_size, self.rank = training.get_world_size_and_rank()
         self.is_rank_zero = self.rank == 0
-        self.tensor_parallel_plan = instantiate(cfg.get("tensor_parallel_plan", None))
-        self.tensor_parallel_dim = cfg.get("tensor_parallel_dim", 1)
-        if self.tensor_parallel_dim > 1 and self.tensor_parallel_plan is None:
-            raise ValueError(
-                "Tensor Parallel plan needs to be provided when tensor parallel is enabled."
-            )
-        if self.world_size % self.tensor_parallel_dim != 0:
-            raise ValueError(
-                f"world_size {self.world_size} must be divisible by tensor_parallel_dim {self.tensor_parallel_dim}"
-            )
-        self.data_parallel_dim = self.world_size // self.tensor_parallel_dim
 
         # Training cfg
         self.clip_grad_norm = cfg.get("clip_grad_norm", None)
@@ -100,10 +89,6 @@ class PPOFullFinetuneRecipeDistributed:
         self.epochs_run = 0
 
     def setup(self, cfg: DictConfig) -> None:
-        """
-        Setup the recipe. This includes training state (if resume_from_checkpoint is True),
-        model, tokenizer, loss, optimizer, sampler, and dataloader.
-        """
         OmegaConf.resolve(cfg)
         utils.log_rank_zero(OmegaConf.to_yaml(cfg))
 
@@ -232,11 +217,6 @@ class PPOFullFinetuneRecipeDistributed:
         dist.barrier()
 
     def setup_training_hyperparameters(self, cfg: DictConfig) -> None:
-        """
-        Sets up the training hyperparameters for the recipe. This includes the GAE hyperparameters,
-        generation hyperparameters, reward masking hyperparameters, and stop token ids.
-        """
-
         # KL hyperparameters
         self.kl_reward_coeff = cfg.kl_reward_coeff
 
@@ -345,8 +325,8 @@ class PPOFullFinetuneRecipeDistributed:
 
         device_mesh = dist.init_device_mesh(
             self.device.type,
-            mesh_shape=(self.data_parallel_dim, self.tensor_parallel_dim),
-            mesh_dim_names=("dp", "tp"),
+            mesh_shape=(self.world_size,),
+            mesh_dim_names=("dp",),
         )
         self.dp_size = device_mesh["dp"].size()
         self.dp_rank = device_mesh["dp"].get_local_rank()
@@ -390,32 +370,30 @@ class PPOFullFinetuneRecipeDistributed:
             )
 
         # Apply Fully Sharded Data Parallelism to the model
-        if self.data_parallel_dim > 1:
-            fsdp_shard_conditions = [
-                partial(
-                    training.get_shard_conditions,
-                    names_to_match=custom_sharded_layers,
-                )
-            ]
-            training.shard_model(
-                model=policy_model,
-                shard_conditions=fsdp_shard_conditions,
-                cpu_offload=fsdp_cpu_offload,
-                reshard_after_forward=reshard_after_forward,
-                dp_mesh=device_mesh["dp"],
+        fsdp_shard_conditions = [
+            partial(
+                training.get_shard_conditions,
+                names_to_match=custom_sharded_layers,
             )
-            training.shard_model(
-                model=ref_policy_model,
-                shard_conditions=fsdp_shard_conditions,
-                cpu_offload=fsdp_cpu_offload,
-                reshard_after_forward=True,
-                dp_mesh=device_mesh["dp"],
-            )
+        ]
+        training.shard_model(
+            model=policy_model,
+            shard_conditions=fsdp_shard_conditions,
+            cpu_offload=fsdp_cpu_offload,
+            reshard_after_forward=reshard_after_forward,
+            dp_mesh=device_mesh["dp"],
+        )
+        training.shard_model(
+            model=ref_policy_model,
+            shard_conditions=fsdp_shard_conditions,
+            cpu_offload=fsdp_cpu_offload,
+            reshard_after_forward=True,
+            dp_mesh=device_mesh["dp"],
+        )
 
         training.load_from_full_model_state_dict(
             policy_model,
             model_state_dict,
-            # is_rank_zero=self.is_rank_zero,
             device=self.device,
             strict=True,
             cpu_offload=fsdp_cpu_offload,
@@ -423,7 +401,6 @@ class PPOFullFinetuneRecipeDistributed:
         training.load_from_full_model_state_dict(
             ref_policy_model,
             model_state_dict,
-            # is_rank_zero=self.is_rank_zero,
             device=self.device,
             strict=True,
             cpu_offload=fsdp_cpu_offload,
@@ -494,18 +471,6 @@ class PPOFullFinetuneRecipeDistributed:
         num_training_steps: int,
         last_epoch: int,
     ) -> Optimizer | None:
-        """
-        Set up the learning rate scheduler based on the provided configuration.
-        It supports both standard optimization and optimizer-in-backward cases.
-
-        Args:
-            cfg_lr_scheduler (Optional[DictConfig]): The learning rate scheduler configuration.
-            num_training_steps (int): The total number of training steps.
-            last_epoch (int): The index of the last epoch.
-
-        Returns:
-            lr_scheduler (Optional[Optimizer]): The learning rate scheduler.
-        """
         if cfg_lr_scheduler is None or not self.enable_lr_scheduler:
             utils.log_rank_zero(
                 "No learning rate scheduler configured. Using constant learning rate."
@@ -565,6 +530,8 @@ class PPOFullFinetuneRecipeDistributed:
 
         trajectories: list[rlhf.Trajectory] = []
         for batch_start in range(0, self.batch_size, self.forward_batch_size):
+            # Chunked processing:
+            # extract a minibatch encodings, responses, and samples for forward computation.
             torch.cuda.empty_cache()
             batch_encodings = encodings[
                 batch_start : batch_start + self.forward_batch_size
@@ -582,23 +549,25 @@ class PPOFullFinetuneRecipeDistributed:
                 batch_start : batch_start + self.forward_batch_size
             ]
             batch_samples = samples[batch_start : batch_start + self.forward_batch_size]
-
-            batch_query_responses = torch.cat([batch.input_ids, batch_responses], dim=1)
-            query_response_padding_masks = (
-                batch_query_responses != self.processor.tokenizer.pad_token_id
-            ).long()
-
-            # step 1.1 create attention masks and position IDs for any padding tokens in inputs, used for future forward passes
-            masks = query_response_padding_masks
-            position_ids = generation.get_position_ids_from_padding_mask(
-                query_response_padding_masks
-            )
-            # step 2. estimate logprobs of the responses using the current policy
             vision_inputs = {
                 k: v
                 for k, v in batch.items()
                 if k not in ["input_ids", "attention_mask"]
             }
+
+            # Step III Trajectory Generation: Part 1
+            # Concatenate query and response token ids to construct query-response sequences,
+            # then compute corresponding attention masks and position ids.
+            batch_query_responses = torch.cat([batch.input_ids, batch_responses], dim=1)
+            masks = (
+                batch_query_responses != self.processor.tokenizer.pad_token_id
+            ).long()
+            position_ids = generation.get_position_ids_from_padding_mask(masks)
+
+            # Step III Trajectory Generation: Part 2
+            # Compute logits over full query-response sequences
+            # then extract and convert only the response positions to logprobs
+            # for both policy and reference models.
             with torch.no_grad():
                 logits = self.policy_model(
                     input_ids=batch_query_responses,
@@ -619,7 +588,6 @@ class PPOFullFinetuneRecipeDistributed:
             del logits
             torch.cuda.empty_cache()
 
-            # step 2.1 estimate logprobs of the responses using the reference policy
             ref_logits = self.ref_policy_model(
                 input_ids=batch_query_responses,
                 position_ids=position_ids,
@@ -636,8 +604,6 @@ class PPOFullFinetuneRecipeDistributed:
             del ref_logits
             torch.cuda.empty_cache()
 
-            # step 4. replace any tokens in the responses after the first stop token (usually EOS token) with padding
-            # resulting in truncated responses
             (
                 response_padding_masks,
                 batch_responses,
@@ -647,8 +613,10 @@ class PPOFullFinetuneRecipeDistributed:
                 self.processor.tokenizer.pad_token_id,
             )
 
-            # step 5. run the reward model on the (query, truncated-response) pairs
-            solutions = [sample["think_solution"] for sample in batch_samples]
+            # Step III Trajectory Generation: Part 3
+            # Compute scalar rewards for each response,
+            # including accuracy, format, and language components.
+            solutions = [sample["solution"] for sample in batch_samples]
 
             acc_rewards = rlhf.accuracy_reward_fn(
                 batch_response_texts, solutions, judge_fn=self.ds.judge
@@ -660,11 +628,11 @@ class PPOFullFinetuneRecipeDistributed:
 
             scores = acc_rewards + format_rewards + language_rewards
 
-            # step 5.1 get_seq_lens
+            # compute response sequence length for logging
             seq_lens = rlhf.get_unmasked_sequence_lengths(response_padding_masks)
 
-            # step 5.2 if configured, apply any penalties for sequences without EOS tokens
-            # or shorter than a certain length
+            # A small trick
+            # Apply penalties to responses that are too short or too long (do not end with an EOS token).
             if self.penalise_no_eos or self.min_response_length:
                 reward_penalty_mask = rlhf.get_reward_penalty_mask(
                     batch_responses,
@@ -678,7 +646,7 @@ class PPOFullFinetuneRecipeDistributed:
             del batch_responses
             torch.cuda.empty_cache()
 
-            # step 6. mask out all the invalid values in the trajectory due to padding tokens
+            # mask out all the invalid values in the trajectory due to padding tokens
             logprobs[response_padding_masks] = 1.0
             ref_logprobs[response_padding_masks] = 1.0
 
@@ -718,18 +686,24 @@ class PPOFullFinetuneRecipeDistributed:
             dynamic_ncols=True,
         )
         for curr_epoch in range(self.epochs_run, self.total_epochs):
-            # Update the sampler to ensure data is correctly shuffled across epochs
-            # in case shuffle is True
             self.sampler.set_epoch(curr_epoch)
             acc_cnt = torch.tensor(0.0, dtype=torch.float32).to(self.device)
             total_cnt = torch.tensor(0.0, dtype=torch.float32).to(self.device)
-            for encodings, inputs, samples in self.dataloader:
+            for encodings, vllm_inputs, samples in self.dataloader:
+                # Step I: Data Flow
+                # The dataloader yields inputs in two formats:
+                # (1) `encodings` contain preprocessed vision and text inputs via hf_processor.
+                # (2) `vllm_inputs` store the same data as VLLM-compatible dictionary inputs.
                 encodings = [b.to(self.device, self.dtype) for b in encodings]
                 num_tokens = (encodings[0].input_ids.numel()) * len(samples)
                 context_length = encodings[0].input_ids.shape[1]
 
+                # Step II: Response Collection
+                # Response collection via vLLM. vllm_inputs are gathered across ranks,
+                # responses are generated on rank 0, then broadcasted to all processes.
+                # response_token_ids are collected and padded for the next step.
                 gathered_inputs = [None for _ in range(self.world_size)]
-                dist.all_gather_object(gathered_inputs, inputs)
+                dist.all_gather_object(gathered_inputs, vllm_inputs)
                 all_inputs = list(chain.from_iterable(gathered_inputs))  # type: ignore
                 if self.is_rank_zero:
                     all_outputs = self.llm.generate(
@@ -741,8 +715,8 @@ class PPOFullFinetuneRecipeDistributed:
                 dist.barrier()
                 dist.broadcast_object_list(all_outputs, src=0)
                 rank_slice = slice(
-                    self.rank * len(inputs),
-                    (self.rank + 1) * len(inputs),
+                    self.rank * len(vllm_inputs),
+                    (self.rank + 1) * len(vllm_inputs),
                 )
                 outputs = all_outputs[rank_slice]
                 assert outputs is not None, f"Get no outputs in rank {self.rank}"
@@ -763,8 +737,8 @@ class PPOFullFinetuneRecipeDistributed:
                 )
                 dist.barrier()
 
-                # step 1. generate the trajectory
                 t0_traj = time.perf_counter()
+                # Step III: Trajectory Generation
                 trajectory = self.generate_trajectory_vllm(
                     encodings,
                     samples,
@@ -775,7 +749,9 @@ class PPOFullFinetuneRecipeDistributed:
                 total_cnt += trajectory.acc_rewards.shape[0]
                 traj_time = time.perf_counter() - t0_traj
 
-                # step 2. get the rewards for the current trajectory
+                # Step IV Policy Update: Part 1
+                # Compute token-level KL rewards and assign final outcome scores
+                # to the last valid token in each sequence.
                 with torch.no_grad():
                     rewards, kl, kl_rewards = rlhf.get_rewards_from_ref(
                         trajectory.scores,
@@ -785,18 +761,21 @@ class PPOFullFinetuneRecipeDistributed:
                         trajectory.seq_lens,
                     )
 
-                # step 3. estimate the ppo advantages
+                # Step IV Policy Update: Part 2
+                # Estimate advantages and returns using the final rewards and response masks.
                 advantages, returns = rlhf.estimate_advantages(
                     rewards,
                     self.gamma,
                     masks=~trajectory.response_padding_masks,
                 )
 
-                # step 4. optimise using ppo objective over multiple epochs
                 t0_ppo = time.perf_counter()
                 rl_stats = []
 
                 for _ in range(self.ppo_epochs):
+                    # Step IV Policy Update: Part 3
+                    # First, the batch is shuffled and divided into PPO mini-batches.
+                    # Then, each mini-batch is further split into backward batches for gradient accumulation.
                     batch_idxs = torch.randperm(self.batch_size, device=self.device)
                     for i in range(0, self.batch_size, self.ppo_batch_size):
                         mini_batch_idxs = batch_idxs[i : i + self.ppo_batch_size]
@@ -811,6 +790,8 @@ class PPOFullFinetuneRecipeDistributed:
                             backward_samples = [
                                 samples[idx.item()] for idx in backward_batch_idxs
                             ]
+                            # Re-collect vision inputs for the backward batch.
+                            # Required because the batch order has been shuffled during chunking.
                             backward_vision_inputs = collate_vision_inputs(
                                 backward_samples, processor=self.processor
                             )
@@ -826,6 +807,8 @@ class PPOFullFinetuneRecipeDistributed:
                                     trajectory,
                                 )
                             )
+                            # Step IV Policy Update: Part 4
+                            # Compute PPO loss and perform a backward pass for the current backward batch.
                             batch_ppo_stats.append(
                                 self.ppo_step(
                                     batch_trajectory,
@@ -855,15 +838,15 @@ class PPOFullFinetuneRecipeDistributed:
                         dist.barrier()
 
                         self.global_step += 1
-                        # Step the learning rate scheduler
 
+                        # Step the learning rate scheduler
                         if self.enable_lr_scheduler and self.lr_scheduler is not None:
                             self.lr_scheduler.step()
 
                 rl_stats = rlhf.PPOStats(*map(torch.stack, zip(*rl_stats)))
                 rl_time = time.perf_counter() - t0_ppo
 
-                # step 5. profit
+                # profit
                 self.steps_run += 1
                 if self.steps_run % self.log_every_n_steps == 0:
                     extra_metrics = {}
@@ -874,11 +857,6 @@ class PPOFullFinetuneRecipeDistributed:
                         "training/temperature"
                     ] = self.generation_kwargs.temperature
 
-                    self.log_analysis(
-                        response_texts,
-                        is_correct=(trajectory.acc_rewards == 1.0).tolist(),
-                    )
-
                     self.log_metrics(
                         trajectory,
                         rl_stats,
@@ -888,6 +866,11 @@ class PPOFullFinetuneRecipeDistributed:
                         num_tokens / rl_time,
                         **extra_metrics,
                     )
+
+                    self.log_reflection_analysis(
+                        response_texts,
+                        is_correct=(trajectory.acc_rewards == 1.0).tolist(),
+                    )
                 self.cleanup_after_step(
                     trajectory, rl_stats, advantages, returns, kl, kl_rewards
                 )
@@ -896,7 +879,7 @@ class PPOFullFinetuneRecipeDistributed:
                 if self.steps_run == self.total_steps:
                     break
 
-            # step 6. evaluation
+            # Evaluation
             self.epochs_run += 1
             dist.all_reduce(acc_cnt, op=dist.ReduceOp.SUM)
             dist.all_reduce(total_cnt, op=dist.ReduceOp.SUM)
@@ -904,12 +887,13 @@ class PPOFullFinetuneRecipeDistributed:
                 f"Training Set Epoch Accuracy: {acc_cnt / total_cnt:.3f}-{acc_cnt}/{total_cnt}"
             )
             if self.is_rank_zero:
+                # Log the first 10 response texts from rank 0 for observing output patterns
                 self.metric_logger.log_table(
                     f"outputs/Epoch {self.epochs_run}",
                     response_texts[:10],
                     step=self.epochs_run,
                 )
-                # step 6.1 training set accuracy
+                # Metrics: training set accuracy
                 self.metric_logger.log(
                     "acc/Training Set Epoch Accuracy",
                     acc_cnt / total_cnt,
@@ -917,7 +901,7 @@ class PPOFullFinetuneRecipeDistributed:
                     key="Epoch",
                 )
 
-                # step 6.2 validation set accuracy
+                # Metrics: validation & test set accuracy
                 validation_acc_low_temp_pass1 = self.eval(
                     dataloader=self.validation_dataloader,
                     eval_name="Validation",
@@ -932,13 +916,13 @@ class PPOFullFinetuneRecipeDistributed:
                     generation_strategy="medium",
                     epoch=curr_epoch,
                 )
-                # validation_acc_high_temp_pass8 = self.eval(
-                #     dataloader=self.validation_dataloader,
-                #     eval_name="Validation",
-                #     passk=8,
-                #     generation_strategy="high",
-                #     epoch=curr_epoch,
-                # )
+                validation_acc_high_temp_pass8 = self.eval(
+                    dataloader=self.validation_dataloader,
+                    eval_name="Validation",
+                    passk=8,
+                    generation_strategy="high",
+                    epoch=curr_epoch,
+                )
                 test_acc_low_temp_pass1 = self.eval(
                     dataloader=self.test_dataloader,
                     eval_name="Test",
@@ -953,13 +937,13 @@ class PPOFullFinetuneRecipeDistributed:
                     generation_strategy="medium",
                     epoch=curr_epoch,
                 )
-                # test_acc_high_temp_pass8 = self.eval(
-                #     dataloader=self.test_dataloader,
-                #     eval_name="Test",
-                #     passk=8,
-                #     generation_strategy="high",
-                #     epoch=curr_epoch,
-                # )
+                test_acc_high_temp_pass8 = self.eval(
+                    dataloader=self.test_dataloader,
+                    eval_name="Test",
+                    passk=8,
+                    generation_strategy="high",
+                    epoch=curr_epoch,
+                )
                 self.metric_logger.log(
                     "acc/Validation Set Epoch Accuracy pass@1 Temperature=0.01",
                     validation_acc_low_temp_pass1,
@@ -972,12 +956,12 @@ class PPOFullFinetuneRecipeDistributed:
                     step=self.epochs_run,
                     key="Epoch",
                 )
-                # self.metric_logger.log(
-                #     "acc/Validation Set Epoch Accuracy pass@8 Temperature=1.0",
-                #     validation_acc_high_temp_pass8,
-                #     step=self.epochs_run,
-                #     key="Epoch",
-                # )
+                self.metric_logger.log(
+                    "acc/Validation Set Epoch Accuracy pass@8 Temperature=1.0",
+                    validation_acc_high_temp_pass8,
+                    step=self.epochs_run,
+                    key="Epoch",
+                )
                 self.metric_logger.log(
                     "acc/Test Set Epoch Accuracy pass@1 Temperature=0.01",
                     test_acc_low_temp_pass1,
@@ -990,20 +974,20 @@ class PPOFullFinetuneRecipeDistributed:
                     step=self.epochs_run,
                     key="Epoch",
                 )
-                # self.metric_logger.log(
-                #     "acc/Test Set Epoch Accuracy pass@8 Temperature=1.0",
-                #     test_acc_high_temp_pass8,
-                #     step=self.epochs_run,
-                #     key="Epoch",
-                # )
+                self.metric_logger.log(
+                    "acc/Test Set Epoch Accuracy pass@8 Temperature=1.0",
+                    test_acc_high_temp_pass8,
+                    step=self.epochs_run,
+                    key="Epoch",
+                )
 
-            # step 8. save checkpoint at current epoch
+            # Save checkpoint at current epoch
             if (self.save_every_n_epochs > 0) and (
                 curr_epoch + 1
             ) % self.save_every_n_epochs == 0:
                 self.save_checkpoint(epoch=curr_epoch)
 
-    def log_analysis(self, texts: list[str], is_correct: list[bool]):
+    def log_reflection_analysis(self, texts: list[str], is_correct: list[bool]):
         reflection_words = [
             "re-check",
             "re-evaluate",
@@ -1022,11 +1006,11 @@ class PPOFullFinetuneRecipeDistributed:
             "yet",
         ]
 
-        # 先把所有文本都转小写，方便后续匹配
+        # Convert all text to lowercase for easier matching
         texts_lower = [t.lower() for t in texts]
         total_count = len(texts_lower)
 
-        # 统计每个文本是否包含反思词，用于后续各种比例计算
+        # Identify whether each text contains reflection words for ratio computation
         has_reflection = [
             any(word in text for word in reflection_words) for text in texts_lower
         ]
@@ -1035,15 +1019,15 @@ class PPOFullFinetuneRecipeDistributed:
             texts[i] for i in range(len(texts)) if has_reflection[i] and is_correct[i]
         ]
 
-        # 总数、正确数、错误数、包含反思词数
+        # Count total, correct, incorrect, and reflection-included samples
         total_correct = sum(is_correct)
         total_incorrect = total_count - total_correct
         reflection_count = sum(has_reflection)
 
-        # 1. 存在反思词的字符串占所有字符串的比例
+        # 1. Ratio of responses that contain at least one reflection word
         reflection_ratio = reflection_count / total_count if total_count else 0.0
 
-        # 2. 正确答案里包含反思词的比例
+        # 2. Among correct responses, ratio that contain reflection words
         if total_correct > 0:
             correct_with_reflection_count = sum(
                 has_reflection[i] for i in range(total_count) if is_correct[i]
@@ -1054,7 +1038,7 @@ class PPOFullFinetuneRecipeDistributed:
         else:
             reflection_ratio_in_correct_answers = 0.0
 
-        # 3. 错误答案里包含反思词的比例
+        # 3. Among incorrect responses, ratio that contain reflection words
         if total_incorrect > 0:
             incorrect_with_reflection_count = sum(
                 has_reflection[i] for i in range(total_count) if not is_correct[i]
@@ -1065,7 +1049,7 @@ class PPOFullFinetuneRecipeDistributed:
         else:
             reflection_ratio_in_incorrect_answers = 0.0
 
-        # 4. 存在反思词的字符串里，答案正确的比例
+        # 4. Among responses with reflection words, ratio that are correct
         if reflection_count > 0:
             correct_in_reflection_texts_count = sum(
                 is_correct[i] for i in range(total_count) if has_reflection[i]
@@ -1076,7 +1060,7 @@ class PPOFullFinetuneRecipeDistributed:
         else:
             correct_ratio_in_reflection_texts = 0.0
 
-        # 5. 不存在反思词的字符串里，答案正确的比例
+        # 5. Among responses without reflection words, ratio that are correct
         no_reflection_count = total_count - reflection_count
         if no_reflection_count > 0:
             correct_in_no_reflection_texts_count = sum(
@@ -1088,15 +1072,15 @@ class PPOFullFinetuneRecipeDistributed:
         else:
             correct_ratio_in_no_reflection_texts = 0.0
 
-        # (A) 所有统计结果
+        # (A) Aggregate all computed statistics
         analysis_dict = {
-            "analysis/reflection_ratio": reflection_ratio,
-            "analysis/reflection_ratio_in_correct_answers": reflection_ratio_in_correct_answers,
-            "analysis/reflection_ratio_in_incorrect_answers": reflection_ratio_in_incorrect_answers,
-            "analysis/correct_ratio_in_reflection_texts": correct_ratio_in_reflection_texts,
-            "analysis/correct_ratio_in_no_reflection_texts": correct_ratio_in_no_reflection_texts,
+            "reflection_analysis/reflection_ratio": reflection_ratio,
+            "reflection_analysis/reflection_ratio_in_correct_answers": reflection_ratio_in_correct_answers,
+            "reflection_analysis/reflection_ratio_in_incorrect_answers": reflection_ratio_in_incorrect_answers,
+            "reflection_analysis/correct_ratio_in_reflection_texts": correct_ratio_in_reflection_texts,
+            "reflection_analysis/correct_ratio_in_no_reflection_texts": correct_ratio_in_no_reflection_texts,
         }
-        # (B) 统计所有反思词的总出现次数（跨文本累加）
+        # (B) Count total occurrences of each reflection word (accumulated across texts)
         reflection_word_frequency = {
             f"reflection_words/{word}": sum(text.count(word) for text in texts_lower)
             for word in reflection_words
@@ -1229,6 +1213,8 @@ class PPOFullFinetuneRecipeDistributed:
     ) -> rlhf.PPOStats:
         torch.cuda.empty_cache()
 
+        # Step IV Policy Update: Part 4.1
+        # Compute (updated) policy model logprobs (only for response tokens) from the current parameters.
         pi_logits = self.policy_model(
             input_ids=trajectory.query_responses,
             position_ids=trajectory.position_ids,
@@ -1246,7 +1232,8 @@ class PPOFullFinetuneRecipeDistributed:
         )
         pi_logprobs[trajectory.response_padding_masks] = 1.0
 
-        # calculate ppo loss
+        # Step IV Policy Update: Part 4.2
+        # Compute PPO loss and auxiliary metrics (KL, entropy, etc.), then backpropagate.
         loss, policy_loss, kl_loss, entropy, ratios, clipfrac = self.loss_fn(
             trajectory.logprobs,
             pi_logprobs,
@@ -1387,7 +1374,7 @@ class PPOFullFinetuneRecipeDistributed:
             llm_model.load_weights(cpu_state_dict.items())
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="full_ppo")
+@hydra.main(version_base=None, config_path="configs", config_name="full_ppo_vllm_distributed")
 def main(cfg: DictConfig):
     recipe = PPOFullFinetuneRecipeDistributed(cfg=cfg)
     recipe.setup(cfg=cfg)

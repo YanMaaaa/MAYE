@@ -65,10 +65,10 @@ batch_size: 128
 num_epochs: 100
 ppo_epochs: 1
 ppo_batch_size: 128
-gradient_accumulation_steps: 1  # Use to increase effective batch size
+gradient_accumulation_steps: 1
 
 
-# Memory management and performance
+
 compile: True  # torch.compile the model + loss, True increases speed + decreases memory
 optimizer:
   _target_: torch.optim.AdamW

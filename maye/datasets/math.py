@@ -10,7 +10,8 @@ from maye.utils.file import open_jsonl
 
 CHAT_COT_PROMPT = "\nSolve the above mathematics problem, write out the solution process according to the question, and use the same LaTeX format as the question in the solution process. Please display the final answer in the format \\boxed{}."
 
-COMPLETION_COT_PROMPT = "A conversation between User and Assistant. The user asks a question with an image,  and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the solution. The reasoning process is enclosed within '<think>' and '</think>', followed by the solution. Ensuring that the final answer in solution is enclosed in \\boxed{{}}. User: {{question}} <|vision_start|><|image_pad|><|vision_end|> Assistant:"
+ZERO_COT_PROMPT = "A conversation between User and Assistant. The user asks a question with an image,  and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the solution. The reasoning process is enclosed within '<think>' and '</think>', followed by the solution. Ensuring that the final answer in solution is enclosed in \\boxed{{}}. User: {{question}} <|vision_start|><|image_pad|><|vision_end|> Assistant:"
+
 
 class MathGenerationDataset(Dataset):
     def __init__(
@@ -45,7 +46,7 @@ class MathGenerationDataset(Dataset):
                 }
             ]
         else:
-            prompt = COMPLETION_COT_PROMPT.format(question=sample["question"])
+            prompt = ZERO_COT_PROMPT.format(question=sample["question"])
 
         prepared_sample = dict(**sample, images=images, prompt=prompt)
 

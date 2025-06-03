@@ -13,7 +13,6 @@ Scalar = Tensor | ndarray | int | float
 
 
 class WandBLogger:
-
     def __init__(
         self,
         project: str = "maye",

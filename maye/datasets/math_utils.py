@@ -86,11 +86,11 @@ class AutoScoringJudge:
         if self.is_two_greater_sign(answer):
             answer = self.trans_greater_sign_to_interval(answer)
 
-        prediction = self.split_by_comma(prediction) # type: ignore
-        answer = self.split_by_comma(answer) # type: ignore
+        prediction = self.split_by_comma(prediction)  # type: ignore
+        answer = self.split_by_comma(answer)  # type: ignore
 
-        temp_list1 = self.trans_plus_minus_sign(prediction) # type: ignore
-        temp_list2 = self.trans_plus_minus_sign(answer) # type: ignore
+        temp_list1 = self.trans_plus_minus_sign(prediction)  # type: ignore
+        temp_list2 = self.trans_plus_minus_sign(answer)  # type: ignore
 
         # Set up a list for allowed errors
         if len(precision) <= 1:
