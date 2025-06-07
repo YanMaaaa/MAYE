@@ -1,4 +1,5 @@
 # Rethinking RL Scaling for Vision Language Models: A Transparent, From-Scratch Framework and Comprehensive Evaluation Scheme
+![image](https://github.com/user-attachments/assets/efd76029-2ac3-4fd1-9b5b-b62d904b905d)
 
 ## 📚 Overview
 
