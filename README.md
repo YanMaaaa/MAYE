@@ -1,5 +1,7 @@
 # Rethinking RL Scaling for Vision Language Models: A Transparent, From-Scratch Framework and Comprehensive Evaluation Scheme
 
+![image](image.png)
+
 ## 📚 Overview
 
 This project presents **MAYE**, a transparent and reproducible framework and a comprehensive evaluation scheme for applying reinforcement learning (RL) to vision-language models (VLMs). The codebase is built entirely from scratch without relying on existing RL toolkits.
